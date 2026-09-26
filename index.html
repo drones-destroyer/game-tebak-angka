@@ -1,0 +1,491 @@
+<!----><script>
+"use strict";
+(function(){
+const IS_BROWSER = (typeof window !== 'undefined') && (typeof document !== 'undefined');
+
+/* ================= CRYPTO (XOR + xorshift PRNG + checksum) ================= */
+const SAVE_KEY = 'TebakAngka.v1::SecretKey::7f3aB9cE1d2F8a0B5c7D4e6F9A8B7C6D5E4F3A2B1C0D';
+
+function hashStr(s){
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++){ h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+  return h >>> 0;
+}
+function xshift(s){
+  s ^= (s << 13) >>> 0; s >>>= 0;
+  s ^= (s >>> 17);
+  s ^= (s << 5) >>> 0; s >>>= 0;
+  return s >>> 0;
+}
+function keystream(seed, len){
+  const out = new Array(len);
+  let s = (seed >>> 0) || 0x9e3779b9;
+  for (let i = 0; i < len; i++){ s = xshift(s); out[i] = s & 0xff; }
+  return out;
+}
+function encryptSave(str){
+  const bytes = [];
+  for (let i = 0; i < str.length; i++) bytes.push(str.charCodeAt(i) & 0xff);
+  const ks = keystream(hashStr(SAVE_KEY), bytes.length);
+  const enc = new Array(bytes.length);
+  let sum = 0;
+  for (let i = 0; i < bytes.length; i++){ enc[i] = bytes[i] ^ ks[i]; sum = (sum + enc[i]) & 0xff; }
+  let hex = bytes.length.toString(16).padStart(4,'0');
+  for (let i = 0; i < enc.length; i++) hex += enc[i].toString(16).padStart(2,'0');
+  hex += sum.toString(16).padStart(2,'0');
+  while (hex.length < 512) hex += Math.floor(Math.random()*16).toString(16);
+  return hex.slice(0, 512).toUpperCase();
+}
+function decryptSave(code){
+  if (!code) return null;
+  code = String(code).toUpperCase().replace(/[^0-9A-F]/g,'');
+  if (code.length < 6) return null;
+  const len = parseInt(code.slice(0,4),16);
+  if (!(len > 0 && len < 400)) return null;
+  const dataHex = code.slice(4, 4 + len*2);
+  if (dataHex.length < len*2) return null;
+  const enc = new Array(len);
+  let calc = 0;
+  for (let i = 0; i < len; i++){
+    enc[i] = parseInt(dataHex.slice(i*2, i*2+2), 16);
+    calc = (calc + enc[i]) & 0xff;
+  }
+  const sumHex = code.slice(4 + len*2, 6 + len*2);
+  if (sumHex.length < 2) return null;
+  if (parseInt(sumHex,16) !== calc) return null;
+  const ks = keystream(hashStr(SAVE_KEY), len);
+  let out = '';
+  for (let i = 0; i < len; i++) out += String.fromCharCode(enc[i] ^ ks[i]);
+  return out;
+}
+
+/* ================= UTIL ================= */
+function levelMax(level){
+  const decade = Math.floor((level - 1) / 3);
+  const mult = [5, 10, 20][(level - 1) % 3];
+  return mult * Math.pow(10, decade);
+}
+function fmtTime(sec){
+  sec = Math.max(0, Math.floor(sec));
+  const h = String(Math.floor(sec/3600)).padStart(2,'0');
+  const m = String(Math.floor((sec%3600)/60)).padStart(2,'0');
+  const s = String(sec%60).padStart(2,'0');
+  return h+':'+m+':'+s;
+}
+
+/* ================= GAME CORE ================= */
+function createGame(io){
+  const st = {
+    phase: 'menu', level: 1, attempts: 0, maxGuess: 5, target: 0,
+    input: '', totalTime: 0, startTime: 0, elapsed: 0,
+    timerId: null, keyboardOn: false
+  };
+
+  function refresh(){
+    io.setInput(st.input);
+    io.setStatus({
+      phase: st.phase, level: st.level, maxGuess: st.maxGuess,
+      attempts: st.attempts, time: fmtTime(st.elapsed)
+    });
+  }
+  function startTimer(){
+    st.startTime = Date.now();
+    if (st.timerId) clearInterval(st.timerId);
+    st.timerId = setInterval(function(){
+      st.elapsed = st.totalTime + Math.floor((Date.now() - st.startTime)/1000);
+      refresh();
+    }, 500);
+  }
+  function newLevel(level, preserveAttempts){
+    st.level = level;
+    st.maxGuess = levelMax(level);
+    st.target = 1 + Math.floor(Math.random() * st.maxGuess);
+    if (!preserveAttempts) st.attempts = 0;
+    st.phase = 'playing';
+    st.input = '';
+    io.println('');
+    io.println('=== LEVEL ' + level + ' (1-' + st.maxGuess + ') ===', 'ok');
+    io.println('Tebak angka antara 1 sampai ' + st.maxGuess + '.', 'hint');
+    io.println('Perintah: "save" simpan | "keyboard" keyboard virtual', 'dim');
+    io.println('');
+    refresh();
+  }
+  function startNewGame(){
+    st.totalTime = 0; st.elapsed = 0; st.phase = 'playing';
+    io.println('');
+    io.println('*** PERMAINAN BARU DIMULAI ***', 'ok');
+    startTimer();
+    newLevel(1, false);
+  }
+  function resumeFromPayload(payload){
+    const m = /^L(\d+)\|A(\d+)\|T(\d+)\|N(-?\d+)$/.exec(payload);
+    if (!m) return false;
+    const lvl = parseInt(m[1],10), att = parseInt(m[2],10);
+    const tim = parseInt(m[3],10), tgt = parseInt(m[4],10);
+    if (!(lvl > 0) || !(tgt >= 1 && tgt <= levelMax(lvl))) return false;
+    st.totalTime = tim; st.elapsed = tim; st.phase = 'playing';
+    io.println('');
+    io.println('*** MELANJUTKAN PERMAINAN TERSIMPAN ***', 'ok');
+    io.println('Waktu tersimpan: ' + fmtTime(tim), 'dim');
+    startTimer();
+    st.level = lvl; st.maxGuess = levelMax(lvl);
+    st.target = tgt; st.attempts = att; st.input = '';
+    io.println('');
+    io.println('=== MELANJUTKAN: LEVEL ' + lvl + ' (1-' + st.maxGuess + ') ===', 'ok');
+    io.println('Tebak angka antara 1 sampai ' + st.maxGuess + '.', 'hint');
+    io.println('Percobaan sebelumnya: ' + att, 'dim');
+    io.println('');
+    refresh();
+    return true;
+  }
+  function makePayload(){
+    return 'L'+st.level+'|A'+st.attempts+'|T'+st.elapsed+'|N'+st.target;
+  }
+  function doGuess(n){
+    if (n === st.target){
+      io.println('>> BENAR! Angkanya adalah ' + st.target + '.', 'ok');
+      io.println('>> Level ' + st.level + ' selesai! Lanjut ke level berikutnya...', 'ok');
+      st.phase = 'transition';
+      refresh();
+      const next = st.level + 1;
+      setTimeout(function(){ newLevel(next, false); }, 900);
+      return;
+    }
+    st.attempts++;
+    if (n < st.target) io.println('>> Lebih besar', 'warn');
+    else io.println('>> Lebih kecil', 'warn');
+    refresh();
+  }
+  function handleEnter(){
+    const trimmed = st.input.trim();
+    st.input = '';
+
+    if (st.phase === 'menu'){
+      if (trimmed === ''){ startNewGame(); refresh(); return; }
+      const dec = decryptSave(trimmed);
+      if (dec && resumeFromPayload(dec)){ refresh(); return; }
+      io.println('>> Kode save tidak valid.', 'err');
+      io.println('   Tekan ENTER kosong untuk mulai dari Level 1.', 'dim');
+      refresh(); return;
+    }
+    if (st.phase === 'transition'){ refresh(); return; }
+    if (st.phase !== 'playing'){ refresh(); return; }
+    if (trimmed === ''){ refresh(); return; }
+
+    if (trimmed === 'save'){
+      const code = encryptSave(makePayload());
+      io.println('');
+      io.println('=== SAVE GAME ===', 'ok');
+      io.println('Level: ' + st.level + ' | Percobaan: ' + st.attempts + ' | Waktu: ' + fmtTime(st.elapsed), 'dim');
+      io.println('Salin kode berikut (512 karakter):', 'dim');
+      io.println(code, 'save');
+      io.println('');
+      refresh(); return;
+    }
+    if (trimmed === 'keyboard'){
+      st.keyboardOn = !st.keyboardOn;
+      io.setKeyboard(st.keyboardOn);
+      io.println('>> Keyboard virtual: ' + (st.keyboardOn ? 'AKTIF' : 'MATI'), 'dim');
+      refresh(); return;
+    }
+    if (/^-?\d+$/.test(trimmed)){ doGuess(parseInt(trimmed,10)); refresh(); return; }
+    io.println('>> Input tidak valid', 'err');
+    refresh();
+  }
+
+  return {
+    state: st,
+    handleEnter: handleEnter,
+    handleChar: function(ch){ st.input += ch; refresh(); },
+    handleBackspace: function(){ st.input = st.input.slice(0, -1); refresh(); },
+    handlePaste: function(t){ st.input += t; refresh(); },
+    refresh: refresh
+  };
+}
+
+/* ================= BROWSER UI ================= */
+function initBrowser(){
+  // viewport meta
+  try {
+    const head = document.head || document.getElementsByTagName('head')[0];
+    if (head && !document.querySelector('meta[name="viewport"]')){
+      const vm = document.createElement('meta');
+      vm.name = 'viewport';
+      vm.content = 'width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover';
+      head.appendChild(vm);
+    }
+  } catch(_){}
+  document.title = 'Tebak  Angka';
+
+  const style = document.createElement('style');
+  style.textContent = `
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; background: #000; color: #c8ffc8;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace;
+    height: 100%; overflow: hidden; -webkit-text-size-adjust: 100%;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #term {
+    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    padding: 10px 12px; display: flex; flex-direction: column;
+    font-size: 15px; line-height: 1.45; overflow: hidden;
+  }
+  #term .hdr {
+    color: #33ff33; font-weight: bold; letter-spacing: 3px;
+    border-bottom: 1px dashed #2a5a2a; padding-bottom: 6px; margin-bottom: 6px;
+    text-align: center; font-size: 14px;
+  }
+  #term .status {
+    color: #00cfcf; font-size: 12px; min-height: 18px;
+    margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  #term .out {
+    flex: 1 1 auto; overflow-y: auto; overflow-x: hidden;
+    white-space: pre-wrap; word-break: break-word;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin; scrollbar-color: #2a5a2a #000;
+    padding-right: 4px;
+  }
+  #term .out::-webkit-scrollbar { width: 6px; }
+  #term .out::-webkit-scrollbar-thumb { background: #2a5a2a; border-radius: 3px; }
+  .line { min-height: 1.4em; }
+  .line.err { color: #ff5555; }
+  .line.ok { color: #55ff55; }
+  .line.warn { color: #ffdd55; }
+  .line.dim { color: #559955; }
+  .line.hint { color: #88eeff; }
+  .line.save { color: #ffff55; word-break: break-all; font-size: 11px;
+    cursor: pointer; background: #0a0a00; padding: 4px 6px; border-radius: 3px;
+    border: 1px dashed #555500; margin: 4px 0; }
+  #term .inp {
+    padding-top: 6px; margin-top: 4px; border-top: 1px dashed #2a5a2a;
+    white-space: pre-wrap; word-break: break-all; min-height: 1.5em;
+    max-height: 5em; overflow: hidden;
+  }
+  #term .inp .pr { color: #33ff33; }
+  #term .inp .ty { color: #ffffff; }
+  #term .inp .cs { color: #33ff33; animation: bk 1s steps(1,end) infinite; }
+  @keyframes bk { 0%,49.99%{opacity:1;} 50%,100%{opacity:0;} }
+  #term .vk {
+    display: none; flex-wrap: wrap; gap: 4px;
+    padding-top: 8px; margin-top: 4px; border-top: 1px dashed #2a5a2a;
+  }
+  #term .vk.on { display: flex; }
+  #term .vk button {
+    background: #0a1a0a; color: #33ff33; border: 1px solid #2a5a2a;
+    padding: 9px 8px; margin: 0; font-family: inherit; font-size: 15px;
+    border-radius: 3px; cursor: pointer; min-width: 34px;
+    user-select: none; -webkit-user-select: none;
+    touch-action: manipulation;
+  }
+  #term .vk button:active { background: #33ff33; color: #000; }
+  #hiddenInput {
+    position: fixed; top: 0; left: 0; width: 1px; height: 1px;
+    opacity: 0; border: 0; padding: 0; margin: 0; font-size: 16px;
+    z-index: -1; pointer-events: none;
+  }
+  .toast {
+    position: fixed; left: 50%; bottom: 80px; transform: translateX(-50%);
+    background: #0a2a0a; color: #33ff33; border: 1px solid #33ff33;
+    padding: 8px 16px; border-radius: 4px; font-size: 13px; z-index: 10;
+    opacity: 0; transition: opacity .2s; pointer-events: none;
+    font-family: inherit;
+  }
+  .toast.on { opacity: 1; }
+  `;
+  (document.head || document.documentElement).appendChild(style);
+
+  const term = document.createElement('div'); term.id = 'term';
+  const hdr = document.createElement('div'); hdr.className = 'hdr'; hdr.textContent = 'T E B A K    A N G K A';
+  const status = document.createElement('div'); status.className = 'status';
+  const out = document.createElement('div'); out.className = 'out';
+  const inp = document.createElement('div'); inp.className = 'inp';
+  const pr = document.createElement('span'); pr.className='pr'; pr.textContent = '> ';
+  const ty = document.createElement('span'); ty.className='ty';
+  const cs = document.createElement('span'); cs.className='cs'; cs.textContent = '_';
+  inp.appendChild(pr); inp.appendChild(ty); inp.appendChild(cs);
+  const vk = document.createElement('div'); vk.className = 'vk';
+
+  term.appendChild(hdr); term.appendChild(status); term.appendChild(out);
+  term.appendChild(inp); term.appendChild(vk);
+
+  const body = document.body || document.documentElement;
+  body.appendChild(term);
+
+  const hidden = document.createElement('input');
+  hidden.id = 'hiddenInput'; hidden.type = 'text';
+  hidden.setAttribute('autocomplete','off');
+  hidden.setAttribute('autocorrect','off');
+  hidden.setAttribute('autocapitalize','off');
+  hidden.setAttribute('spellcheck','false');
+  body.appendChild(hidden);
+
+  const toast = document.createElement('div');
+  toast.className = 'toast';
+  body.appendChild(toast);
+  let toastTimer = null;
+  function showToast(msg){
+    toast.textContent = msg;
+    toast.classList.add('on');
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(function(){ toast.classList.remove('on'); }, 1500);
+  }
+
+  const io = {
+    println: function(text, cls){
+      const line = document.createElement('div');
+      line.className = 'line' + (cls ? ' ' + cls : '');
+      line.textContent = String(text);
+      out.appendChild(line);
+      out.scrollTop = out.scrollHeight;
+    },
+    setInput: function(text){
+      if (text.length > 80) ty.textContent = '...' + text.slice(-77);
+      else ty.textContent = text;
+    },
+    setStatus: function(info){
+      if (info.phase === 'menu') status.textContent = 'Menu utama';
+      else if (info.phase === 'transition') status.textContent = 'Level ' + info.level + ' | Selesai!';
+      else status.textContent = 'Level ' + info.level + ' (1-' + info.maxGuess + ')  |  Percobaan: ' + info.attempts + '  |  ' + info.time;
+    },
+    setKeyboard: function(on){ vk.classList.toggle('on', on); }
+  };
+
+  const game = createGame(io);
+
+  io.println('=============================', 'dim');
+  io.println('    T E B A K   A N G K A', 'ok');
+  io.println('=============================', 'dim');
+  io.println('');
+  io.println('Tekan ENTER untuk mulai dari Level 1,', 'dim');
+  io.println('atau tempel kode save lalu ENTER untuk melanjutkan.', 'dim');
+  io.println('');
+  io.println('Perintah khusus:', 'hint');
+  io.println('  save     -> simpan progres (kode 512 karakter)', 'dim');
+  io.println('  keyboard -> tampilkan/sembunyikan keyboard virtual', 'dim');
+  io.println('');
+  game.refresh();
+
+  const vkeys = ['1','2','3','4','5','6','7','8','9','0','-','Del','Enter'];
+  vkeys.forEach(function(k){
+    const b = document.createElement('button');
+    b.type = 'button'; b.textContent = k;
+    b.addEventListener('click', function(e){
+      e.preventDefault(); e.stopPropagation();
+      if (k === 'Enter') game.handleEnter();
+      else if (k === 'Del') game.handleBackspace();
+      else game.handleChar(k);
+      try { hidden.focus({ preventScroll: true }); } catch(_){ hidden.focus(); }
+    });
+    vk.appendChild(b);
+  });
+
+  document.addEventListener('keydown', function(e){
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key === 'Enter'){ e.preventDefault(); game.handleEnter(); }
+    else if (e.key === 'Backspace'){ e.preventDefault(); game.handleBackspace(); }
+    else if (e.key.length === 1){ e.preventDefault(); game.handleChar(e.key); }
+  });
+
+  // Fallback mobile IME
+  hidden.addEventListener('input', function(){
+    const v = hidden.value;
+    if (!v) return;
+    hidden.value = '';
+    for (let i = 0; i < v.length; i++) game.handleChar(v[i]);
+  });
+
+  document.addEventListener('paste', function(e){
+    const cd = e.clipboardData || window.clipboardData;
+    if (!cd) return;
+    let text = cd.getData('text');
+    if (!text) return;
+    e.preventDefault();
+    text = text.replace(/\s+/g,'');
+    game.handlePaste(text);
+  });
+
+  function focusHidden(){
+    try { hidden.focus({ preventScroll: true }); }
+    catch(_){ try { hidden.focus(); } catch(__){} }
+  }
+  document.addEventListener('click', focusHidden);
+  document.addEventListener('touchend', focusHidden, { passive: true });
+
+  // Click-to-copy kode save
+  out.addEventListener('click', function(e){
+    const t = e.target;
+    if (t && t.classList && t.classList.contains('save')){
+      const text = t.textContent;
+      if (navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(text).then(
+          function(){ showToast('Kode disalin ke clipboard!'); },
+          function(){ showToast('Gagal menyalin, pilih manual.'); }
+        );
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = text; ta.style.position='fixed'; ta.style.opacity='0';
+        body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); showToast('Kode disalin!'); }
+        catch(_){ showToast('Gagal menyalin.'); }
+        body.removeChild(ta);
+      }
+    }
+  });
+
+  // Auto-show virtual keyboard on touch devices
+  const isTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+  if (isTouch){ game.state.keyboardOn = true; io.setKeyboard(true); }
+
+  setTimeout(focusHidden, 150);
+}
+
+/* ================= NODE / TERMINAL UI ================= */
+function initNode(){
+  const readline = require('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const C = { err:'91', ok:'92', warn:'93', dim:'90', hint:'96', save:'93' };
+  const io = {
+    println: function(text, cls){
+      let s = String(text);
+      if (cls && C[cls]) s = '\x1b['+C[cls]+'m'+s+'\x1b[0m';
+      process.stdout.write(s + '\n');
+    },
+    setInput: function(){}, setStatus: function(){}, setKeyboard: function(){}
+  };
+  const game = createGame(io);
+  io.println('');
+  io.println('=============================', 'dim');
+  io.println('    T E B A K   A N G K A', 'ok');
+  io.println('=============================', 'dim');
+  io.println('');
+  io.println('Tekan ENTER untuk mulai dari Level 1,', 'dim');
+  io.println('atau tempel kode save lalu ENTER untuk melanjutkan.', 'dim');
+  io.println('');
+  io.println('Perintah: "save" simpan | "keyboard" (khusus browser)', 'dim');
+  io.println('');
+  rl.setPrompt('> ');
+  rl.prompt();
+  rl.on('line', function(line){
+    game.state.input = line;
+    game.handleEnter();
+    rl.prompt();
+  });
+  rl.on('SIGINT', function(){
+    io.println('');
+    io.println('Sampai jumpa!', 'dim');
+    process.exit(0);
+  });
+  rl.on('close', function(){ process.exit(0); });
+}
+
+/* ================= BOOT ================= */
+if (IS_BROWSER){
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initBrowser);
+  else initBrowser();
+} else {
+  initNode();
+}
+})();
+//</script>
